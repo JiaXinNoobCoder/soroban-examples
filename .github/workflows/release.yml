@@ -1,0 +1,28 @@
+name: Build And Release Increment
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Unique release name"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+jobs:
+  release-increment:
+    uses: stellar-expert/soroban-build-workflow/.github/workflows/release.yml@main
+    with:
+      release_name: ${{ github.event.inputs.release_name || github.ref_name }}
+      release_description: "Increment contract demo release"
+      relative_path: '["increment"]'
+      package: "soroban-increment-contract"
+    secrets:
+      release_token: ${{ secrets.GITHUB_TOKEN }}
