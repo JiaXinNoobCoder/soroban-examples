@@ -1,0 +1,105 @@
+name: Build And Release Increment
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Unique release name"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+jobs:
+  release-increment:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: increment
+    env:
+      PACKAGE_NAME: soroban-increment-contract
+      RELEASE_NAME: ${{ github.event.inputs.release_name || github.ref_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust cache
+        uses: stellar/actions/rust-cache@main
+
+      - name: Update Rust and add wasm target
+        run: |
+          rustup update
+          rustup target add wasm32v1-none
+
+      - name: Print versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Set up Stellar CLI
+        uses: stellar/stellar-cli@v23.1.1
+
+      - name: Build contract
+        run: |
+          PACKAGE_VERSION="$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "'"${PACKAGE_NAME}"'") | .version')"
+          if [ -z "${PACKAGE_VERSION}" ] || [ "${PACKAGE_VERSION}" = "null" ]; then
+            echo "Failed to resolve package version for ${PACKAGE_NAME}"
+            exit 1
+          fi
+
+          OUTPUT_DIR="${RUNNER_TEMP}/increment-release"
+          mkdir -p "${OUTPUT_DIR}"
+
+          stellar contract build \
+            --package "${PACKAGE_NAME}" \
+            --out-dir "${OUTPUT_DIR}" \
+            --meta "source_repo=github:${{ github.repository }}"
+
+          GENERATED_WASM="$(echo "${OUTPUT_DIR}"/*.wasm)"
+          WASM_FILE_NAME="increment_v${PACKAGE_VERSION}.wasm"
+          cp "${GENERATED_WASM}" "${OUTPUT_DIR}/${WASM_FILE_NAME}"
+          stellar contract optimize \
+            --wasm "${OUTPUT_DIR}/${WASM_FILE_NAME}" \
+            --wasm-out "${OUTPUT_DIR}/${WASM_FILE_NAME}"
+
+          WASM_HASH="$(sha256sum "${OUTPUT_DIR}/${WASM_FILE_NAME}" | cut -d ' ' -f 1)"
+
+          echo "OUTPUT_DIR=${OUTPUT_DIR}" >> "${GITHUB_ENV}"
+          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "${GITHUB_ENV}"
+          echo "WASM_FILE_NAME=${WASM_FILE_NAME}" >> "${GITHUB_ENV}"
+          echo "WASM_HASH=${WASM_HASH}" >> "${GITHUB_ENV}"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${RELEASE_NAME}" "${OUTPUT_DIR}/${WASM_FILE_NAME}" \
+            --title "${RELEASE_NAME}" \
+            --notes "Increment contract demo release"
+
+      - name: Output build summary
+        run: |
+          echo "WASM: ${WASM_FILE_NAME}"
+          echo "SHA256: ${WASM_HASH}"
+          {
+            echo "## Increment Release"
+            echo ""
+            echo "- Release: \`${RELEASE_NAME}\`"
+            echo "- WASM: \`${WASM_FILE_NAME}\`"
+            echo "- SHA256: \`${WASM_HASH}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Attest build
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "${{ env.OUTPUT_DIR }}/${{ env.WASM_FILE_NAME }}"
+          subject-name: "${{ env.WASM_FILE_NAME }}"
