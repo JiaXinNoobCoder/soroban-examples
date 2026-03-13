@@ -1,0 +1,109 @@
+name: Increment Integration Tests
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "increment/**"
+      - ".github/workflows/increment-integration.yml"
+  pull_request:
+    paths:
+      - "increment/**"
+      - ".github/workflows/increment-integration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Increment Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: increment
+
+    services:
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_DB: increment_test
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 1s
+          --health-timeout 1s
+          --health-retries 30
+
+      stellar:
+        image: stellar/quickstart:testing
+        ports:
+          - 8000:8000
+        env:
+          ENABLE_SOROBAN_RPC: "true"
+          NETWORK: local
+        options: >-
+          --health-cmd "curl -sf http://localhost:8000/soroban/rpc -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' 2>/dev/null | grep -q healthy || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 60
+          --health-start-period 30s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Rust + WASM build ──
+      - name: Set up Rust cache
+        uses: stellar/actions/rust-cache@main
+
+      - name: Update Rust and add wasm target
+        run: |
+          rustup update
+          rustup target add wasm32v1-none
+          rustup target add wasm32-unknown-unknown
+
+      - name: Set up Stellar CLI
+        uses: stellar/stellar-cli@v23.1.1
+
+      - name: Build increment WASM
+        run: make build
+
+      # ── Node + TS test runtime ──
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      # ── Wait for Friendbot ──
+      - name: Wait for Friendbot readiness
+        run: |
+          echo "Waiting for friendbot..."
+          for i in $(seq 1 40); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://localhost:8000/friendbot?addr=GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3QJZNSR")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Friendbot ready!"
+              break
+            fi
+            echo "  status=$HTTP_CODE, retrying in 5s..."
+            sleep 5
+          done
+
+      # ── Database init ──
+      - name: Init test database schema
+        run: psql "$DATABASE_URL" -f tests/db/schema.sql
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/increment_test
+
+      # ── Run integration tests ──
+      - name: Run integration tests
+        run: npx dotenv-cli -e .env.test -- jest --detectOpenHandles --forceExit --verbose
+        env:
+          NODE_ENV: test
